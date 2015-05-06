@@ -19,12 +19,14 @@ from typing import Dict, List
 # http://toolz.readthedocs.org/en/latest/
 # library that adds common functions, primarely for list and dictionary manipulation
 from toolz.curried import pipe, filter, map
+from toolz import curry
 
 
 class SimpleServer:
     def __init__(self, info: ServerInfo, servers: List[ServerInfo],
                  loop, data: Dict[str, str]):
         self.servers = servers
+        self.servers.append(info)
         self.loop = loop
         self.info = info
         self.data = data
@@ -33,7 +35,7 @@ class SimpleServer:
                                  info.ip,
                                  info.port,
                                  loop=loop),
-            asyncio.async)
+            loop.run_until_complete)
 
         # the async function enqueues a coroutine to be run in the event loop,
         # and continues current flow immediatly without waiting
@@ -45,21 +47,43 @@ class SimpleServer:
         pipe(self.servers,
              filter(lambda s: s != self.info),
              map(self.send_data_to),
-             map(asyncio.async),
-             list)
+             list  # calling list will force the lazy sequence to be evaluated
+             )
+
+    def send_data_to(self, recipient):
+        pipe(
+            DataMessage(self.data, self.info),
+            curry(self.send_message_to, recipient),
+            asyncio.async
+        )
 
     @asyncio.coroutine
-    def send_data_to(self, server: ServerInfo):
+    def send_message_to(self, recipient: ServerInfo, msg: Message):
         # asyncio.sleep syspends the function and allows the event loop to continue processing on the next scheduled
         # coroutine in the queue, until this one finishes its sleep
         yield from asyncio.sleep(3)
-        reader, writer = yield from asyncio.open_connection(server.ip,
-                                                            server.port,
+        reader, writer = yield from asyncio.open_connection(recipient.ip,
+                                                            recipient.port,
                                                             loop=loop)
-        pipe(SendData(self.data, self.info),
+        pipe(msg,
              pickle.dumps,
              writer.write)
         writer.close()
+
+    @asyncio.coroutine
+    def sync_servers_list(self):
+        pipe(self.servers,
+             filter(lambda s: s != self.info),
+             map(self.send_servers_list_to),
+             list  # calling list will force the lazy sequence to be evaluated
+             )
+
+    def send_servers_list_to(self, recipient):
+        pipe(
+            ServerListMessage(self.servers, self.info),
+            curry(self.send_message_to, recipient),
+            asyncio.async
+        )
 
     @asyncio.coroutine
     def handle_msg(self, reader, writer):
@@ -69,24 +93,31 @@ class SimpleServer:
         # decodes the object from bytes
         data = pickle.loads(msg)
 
+        # if we see a new server then we update out own list and send the updated list to all other servers
+        if isinstance(data, Message):
+            if not(data.sender in self.servers):
+                self.servers.append(data.sender)
+                asyncio.async(self.sync_servers_list())
+
         # match message type and perform appropiate actions
         if isinstance(data, Inform):
             print(data.info)
-        elif isinstance(data, SendData):
+        elif isinstance(data, ServerListMessage):
+            print('%s got new serverlist %d' % (self.info, len(self.servers)))
+            self.servers = list(set(data.servers) | set(self.servers))  # union of the two server lists
+        elif isinstance(data, DataMessage):
             # the difference between received dataset and local
             new_data_keys = set(data.data.keys()) - set(self.data.keys())
+            new_data_keys_other = set(self.data.keys()) - set(data.data.keys())
 
-            # syncing one piece at the time just to create more action
             for k in new_data_keys:
                 self.data[k] = data.data[k]
-                break
 
             # if the other guys dataset is missing some of our data, then we schedule a sync
-            if len(set(self.data.keys()) - set(data.data.keys())) > 0:
-                asyncio.async(self.send_data_to(data.sender))
+            if len(new_data_keys_other) > 0:
+                self.send_data_to(data.sender)
 
-            print('synced %r' % self.info.port)
-            print(self.data)
+            print('synced %s, now has data: %s' % (self.info, self.data))
         else:
             print('unkown message type!')
             print(data)
@@ -100,18 +131,22 @@ if __name__ == "__main__":
     # the backbone of async is its event loop which is responsible for running the tasks you give it
     loop = asyncio.get_event_loop()
 
-    # initial language databases spread on the servers
-    data1 = {'dk': 'goddag', 'en': 'hello', 'fr': 'bonjour'}
-    data2 = {'jp': 'konnichiwa', 'ch': 'ni hao'}
-    data3 = {'hw': 'aloha'}
-
     # information for three servers
-    servers = [ServerInfo('127.0.0.1', 7777), ServerInfo('127.0.0.1', 8888), ServerInfo('127.0.0.1', 9999)]
+    servers = [
+        ServerInfo('127.0.0.1', 5001),
+        ServerInfo('127.0.0.1', 5002),
+        ServerInfo('127.0.0.1', 5003),
+        ServerInfo('127.0.0.1', 5004),
+        ServerInfo('127.0.0.1', 5005),
+    ]
 
+    # the servers only know themselves and the main server from the beginning
     started_servers = [
-        SimpleServer(servers[0], servers, loop, data1),
-        SimpleServer(servers[1], servers, loop, data2),
-        SimpleServer(servers[2], servers, loop, data3),
+        SimpleServer(servers[0], [], loop, {'dk': 'goddag'}),
+        SimpleServer(servers[1], [servers[0]], loop, {'en': 'hello'}),
+        SimpleServer(servers[2], [servers[0]], loop, {'fr': 'bonjour'}),
+        SimpleServer(servers[3], [servers[0]], loop, {'jp': 'konnichiwa'}),
+        SimpleServer(servers[4], [servers[0]], loop, {'ch': 'ni hao'}),
     ]
 
     try:
