@@ -1,2 +1,2 @@
 # python-distributed-system
-initial prototype idea implementation of a distributed data replication system in python.
+Playing around with python techniques such as asyncio and optional typing..
